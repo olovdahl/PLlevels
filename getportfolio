@@ -1,0 +1,372 @@
+import csv
+import io
+from collections import defaultdict
+import pprint
+
+# ==============================================================================
+# 1. DATA DEFINITIONS (The real-world constraints)
+# ==============================================================================
+PL4 = {
+    "EQ_EM": [0.36, 1.08, 2.16, 3.6, 5.4, 7.2, 7.2], "EQ_US": [1.8, 8.4, 16.8, 28, 42, 56, 56],
+    "EQ_JP": [0.2, 0.6, 1.2, 2, 3, 4, 4], "EQ_EU": [2.64, 0.92, 3.84, 6.4, 9.6, 12.8, 12.8],
+    "BO_SEK": [4.3, 16.75, 28.35, 28.35, 15.75, 0, 0], "MM_SEK": [86.0, 60.0, 25, 5, 0, 0, 0],
+    "HY_SEK": [1.44, 3.61, 6.49, 6.49, 3.61, 0, 0], "IG_SEK": [2.26, 5.64, 10.16, 10.16, 5.64, 0, 0],
+    "EQ_SE": [1.0, 3.0, 6, 10, 15, 20, 20],
+}
+PL3 = {
+    "EQ_SE": [1.0, 3.0, 6, 10, 15, 20, 20], "EQ_EM": [0.36, 1.08, 2.16, 3.6, 5.4, 7.2, 7.2],
+    "EQ_WI": [4.64, 9.92, 21.84, 36.4, 54.6, 72.8, 72.8], "MM_SEK": [86.0, 60.0, 25, 5, 0, 0, 0],
+    "BO_SEK": [4.3, 16.75, 28.35, 28.35, 15.75, 0, 0], "CR_SEK": [3.7, 9.25, 16.65, 16.65, 9.25, 0, 0],
+}
+PL2 = {
+    "EQ_ACWI": [5.0, 11.0, 24.0, 40.0, 60.0, 80.0, 80.0], "FI_SEK": [8.0, 26.0, 45.0, 45.0, 25.0, 0, 0],
+    "EQ_SE": [1.0, 3.0, 6, 10, 15, 20, 20], "MM_SEK": [86.0, 60.0, 25, 5, 0, 0, 0],
+}
+reduction_table = {
+    "EQ_SE": 37.5, "EQ_US": 37.5, "EQ_EU": 37.5, "EQ_JP": 37.5, "EQ_EM": 37.5,
+    "BO_SEK": 37.5, "IG_SEK": 37.5, "HY_SEK": 37.5, "MM_SEK": 37.5, "EQ_WI": 25,
+    "CR_SEK": 25, "EQ_ACWI": 12.5, "FI_SEK": 12.5,
+}
+pl_dicts = [("PL2", PL2), ("PL3", PL3), ("PL4", PL4)]
+
+# ==============================================================================
+# 2. DATA LOADING FUNCTION
+# ==============================================================================
+def load_funds_from_csv(file_content):
+    funds_catalog = {}
+    print("--- Inspecting Fund Data ---")
+    try:
+        f = io.StringIO(file_content)
+        reader = csv.reader(f, delimiter=';')
+        
+        for i, row in enumerate(reader):
+            if not row: continue # Skip empty rows
+            try:
+                if len(row) < 3:
+                    print(f"Warning: Skipping malformed row {i+1}: {row}")
+                    continue
+                name, isin, asset_class = [item.strip() for item in row]
+                if not name or not asset_class:
+                    print(f"Warning: Skipping row {i+1} with missing name or class: {row}")
+                    continue
+                funds_catalog[name] = {"class": asset_class, "isin": isin}
+            except Exception as e:
+                print(f"Warning: Could not process row {i+1}: {row}. Error: {e}")
+
+        print(f"Successfully loaded and processed {len(funds_catalog)} funds.")
+        return funds_catalog
+    except Exception as e:
+        print(f"FATAL: Could not read or process the fund data. Error: {e}")
+        return None
+
+# ==============================================================================
+# 3. CORE LOGIC & HELPERS
+# ==============================================================================
+def find_leaf_PL(pl_dicts, asset_class):
+    for name, pl in reversed(pl_dicts):
+        if asset_class in pl:
+            return name, pl
+    return None, None
+
+def allocate_funds_within_budget(initial_funds, satellites_to_add, reduction_table, pl_dicts, risk_index, funds_catalog):
+    final_portfolio = {name: data.copy() for name, data in initial_funds.items()}
+    allocation_details = []
+    
+    sats_by_class = defaultdict(list)
+    for fund_name in satellites_to_add:
+        asset_class = funds_catalog.get(fund_name, {}).get("class")
+        if asset_class:
+            sats_by_class[asset_class].append({"name": fund_name})
+
+    for asset_class, satellites in sats_by_class.items():
+        core_fund_name, class_budget = None, 0
+        for name, data in initial_funds.items():
+            if funds_catalog.get(name, {}).get("class") == asset_class:
+                core_fund_name, class_budget = name, data["alloc"]
+                break
+        if not core_fund_name:
+            print(f"Warning: No core fund for asset class '{asset_class}'. Skipping satellites.")
+            continue
+        
+        reduction_pct = reduction_table.get(asset_class, 0)
+        headroom_to_distribute = class_budget * (reduction_pct / 100)
+
+        for sat in satellites:
+            _, pl_data = find_leaf_PL(pl_dicts, asset_class)
+            sat["leaf_limit"] = pl_data[asset_class][risk_index] if pl_data else 0
+
+        sorted_sats = sorted(satellites, key=lambda x: x["leaf_limit"])
+        num_remaining_sats = len(sorted_sats)
+        for sat_info in sorted_sats:
+            if num_remaining_sats <= 0 or headroom_to_distribute <= 1e-9:
+                sat_info["allocated"] = 0; continue
+            equal_share = headroom_to_distribute / num_remaining_sats
+            allocation = min(sat_info["leaf_limit"], equal_share)
+            sat_info["allocated"] = allocation
+            headroom_to_distribute -= allocation
+            num_remaining_sats -= 1
+
+        for sat_info in sorted_sats:
+            alloc = sat_info["allocated"]
+            if alloc > 0:
+                final_portfolio[sat_info["name"]] = {"alloc": alloc}
+                final_portfolio[core_fund_name]["alloc"] -= alloc
+            allocation_details.append({"fund_name": sat_info["name"], "asset_class": asset_class, "allocated": alloc, "drew_from": core_fund_name})
+            
+    return final_portfolio, allocation_details
+
+# ==============================================================================
+# 4. SCRIPT EXECUTION WITH YOUR DATA
+# ==============================================================================
+if __name__ == "__main__":
+    # --- STEP 1: Load the fund data from your provided text ---
+    csv_content = """
+    ODIN Global C SEK;NO0010923824;EQ_WO
+    ODIN Norden C SEK;NO0010923931;EQ_SE
+    ODIN Norge C SEK;NO0010924046;EQ_SE
+    ODIN Sverige C SEK;NO0010924764;EQ_SE
+    Pareto ESG Global Corporate Bond A;LU1199945780;HY_SEK
+    Pareto ESG Global Corporate Bond NET;LU1199945947;HY_SEK
+    Pareto Räntefond;SE0000813933;IG_SEK
+    PGIM Global Total Return ESG Bond SEK H;IE00BKY71X69;CR_SEK
+    PGIM Global Total Return ESG Bond USD I;IE00BKY72113;CR_SEK
+    PGIM US Corporate Bond SEK H;IE00BD2ML234;IG_SEK
+    PGIM US Corporate Bond USD A;IE00BD2ML341;IG_SEK
+    Pictet-Biotech PUSD;LU0090689299;EQ_ACWI
+    Pictet-Clean Energy P USD;LU0280430660;EQ_ACWI
+    Pictet-European Sustainable Eqs P EUR;LU0144509717;EQ_EU
+    Pictet-Health PUSD;LU0188501257;EQ_ACWI
+    Pictet-Water P EUR;LU0104884860;EQ_ACWI
+    PIMCO ESG Income Fund SEK-Hedge;IE000V9C97Z4;FI_SEK
+    PIMCO GIS Emerging Markets Bond ESG Fund Adm SEK;IE000IPVAAO6;HY_SEK
+    PIMCO GIS Emerging Markets Bond ESG Fund Adm USD;IE00BK958X43;HY_SEK
+    PIMCO GIS ESG Income Instl USD Acc;IE00BMW4NH15;FI_SEK
+    PriorNilsson Globala Utdelare;SE0009580814;EQ_WO
+    PriorNilsson Idea;SE0001599432;ALTS
+    PriorNilsson Realinvest;SE0005189537;EQ_SE
+    PriorNilsson Sverige Aktiv A;SE0004636447;EQ_SE
+    PriorNilsson Yield;SE0001008434;ALTS
+    Robeco Global SDG Credits DH SEK Cap;LU2091212980;CR_SEK
+    Robeco Global SDG Credits DH SEK Cap;LU2091212980;IG_SEK
+    Robeco Global SDG Credits FH SEK NET;LU2914529065;CR_SEK
+    Robeco Global SDG Credits IH USD Cap;LU1811861787;IG_SEK
+    Robeco New World Financials D €;LU0187077481;EQ_ACWI
+    RobecoSAM Global SDG Equities D;LU2145460353;EQ_WO
+    RobecoSAM Smart Energy Equities D;LU2145461757;EQ_WO
+    RobecoSAM Sustainable Healthy Living Equities D;LU2146189407;EQ_WO
+    RobecoSAM Sustainable Water Eqs D EUR;LU2146190835;EQ_WO
+    Schroder China Opportunities A;LU0244354667;EQ_EM
+    Schroder GAIA Helix A Acc SEK H;LU2392591892;ALTS
+    Schroder GAIA Helix A Acc USD;LU1809995589;ALTS
+    Schroder ISF Asian Opports A Acc USD;LU0106259558;EQ_EM
+    Schroder ISF BRIC A Acc USD;LU0228659784;EQ_EM
+    Schroder ISF Emerging Europe A Dis EUR;LU0106820458;EQ_EM
+    Schroder ISF Frntr Mkts Eq A Acc USD;LU0562313402;EQ_EM
+    Schroder ISF Glbl Engy Tnstn A Acc USD;LU1983299162;EQ_ACWI
+    Schroder ISF Glbl MA Bal A Acc SEK H;LU0776415308;MIX
+    Schroder ISF Global Smlr Coms A Acc USD;LU0240877869;EQ_ACWI
+    Schroder ISF Greater China A Acc USD;LU0140636845;EQ_EM
+    Schroder ISF Japanese Eq A Acc JPY;LU0106239873;EQ_JP
+    Schroder ISF Jpn Opports A Acc JPY;LU0270818197;EQ_JP
+    Schroder ISF Jpn Opports C Acc JPY NET;LU0270819245;EQ_JP
+    Schroder ISF Jpn Smlr Coms A Acc JPY;LU0106242315;EQ_JP
+    Schroder ISF Latin American A Acc USD;LU0106259046;EQ_EM
+    Schroder ISF US S&M Cap Eq A Acc USD;LU0205193047;EQ_US
+    Schroder ISF US Smaller Coms A Acc USD;LU0106261612;EQ_US
+    SEB 358 Obligationsfond Flexibel SEK;SE0000577454;MM_SEK
+    SEB 364 Sverigefond Småbolag;SE0000577389;EQ_SE
+    SEB 372 Sverigefond;SE0000775298;EQ_SE
+    SEB 381 Sverige Expanderad;SE0000984197;EQ_SE
+    SEB 382 Nordenfond;SE0000984189;EQ_SE
+    SEB 383 Europafond;SE0000984171;EQ_EU
+    SEB 385 Emerging Marketsfond;SE0000984155;EQ_EM
+    SEB 386 Asienfond ex-Japan;SE0000984148;EQ_EM
+    SEB 388 Läkemedelsfond;SE0000984122;EQ_ACWI
+    SEB 389 Teknologifond;SE0000984114;EQ_ACWI
+    SEB 392 Korträntefond SEK;SE0000984080;MM_SEK
+    SEB 506 Fastighetsfond;SE0000433096;EQ_SE
+    SEB 518 Europafond Småbolag;SE0000433252;EQ_EU
+    SEB 60 WWF Nordenfond;SE0000691750;EQ_SE
+    SEB 705 Nordamerikafond Småbolag;SE0000432601;EQ_US
+    SEB 807 Sverigefond Småbolag C/R;SE0000434201;EQ_SE
+    SEB 863 Global High Yield Fund;LU0413134395;HY_SEK
+    SEB 939 Realräntefond D SEK - Lux utd;LU0055809197;BO_SEK
+    SEB 990 Asset Selection C SEK - Lux ack;LU0256625632;ALTS
+    SEB Aktiesparfond;SE0000984130;MIX
+    SEB Blandfond Sverige;SE0000500407;MIX
+    SEB Dynamisk Aktiefond;SE0000775348;EQ_ACWI
+    SEB Likviditetsfond SEK;SE0000577470;MM_SEK
+    SEB Nordamerikafond Små och Medelstora Bolag;SE0000434268;EQ_US
+    SEB Sweden Equity C (SEK);LU0047322432;EQ_SE
+    SEB Världenfond;SE0000984098;MIX
+    Sensor Sverige Select;SE0002801290;MIX
+    Simplicity Fastigheter A;SE0015243258;EQ_SE
+    Simplicity Fastigheter B;SE0015243282;EQ_SE
+    Simplicity Företagsobligationer A;SE0004452118;CR_SEK
+    Simplicity Företagsobligationer B;SE0006963617;CR_SEK
+    Simplicity Global Corporate Bond A;SE0004926368;HY_SEK
+    Simplicity High Yield;SE0014555223;HY_SEK
+    Simplicity High Yield B;SE0014555231;HY_SEK
+    Simplicity Likviditet A;SE0001827692;MM_SEK
+    Simplicity Norden;SE0000988750;EQ_SE
+    Simplicity Småbolag Global;SE0010520403;EQ_ACWI
+    Simplicity Småbolag Sverige A;SE0009161540;EQ_SE
+    Simplicity Sverige;SE0006453536;EQ_SE
+    SKAGEN Global SEK A;NO0008004009;EQ_ACWI
+    SKAGEN Kon-Tiki A;NO0010140502;EQ_EM
+    Spiltan Aktiefond Investmentbolag;SE0004297927;EQ_SE
+    Spiltan Aktiefond Småland;SE0002566349;EQ_SE
+    Spiltan Aktiefond Stabil;SE0001015348;EQ_SE
+    Spiltan Enkel;SE0012740926;MIX
+    Spiltan Globalfond Investmentbolag;SE0008613939;EQ_WO
+    Spiltan Högräntefond;SE0005798329;HY_SEK
+    Spiltan Realinvest Global;SE0019353053;EQ_ACWI
+    Spiltan Räntefond Sverige;SE0002152140;CR_SEK
+    Spiltan Småbolagsfond;SE0001015355;EQ_SE
+    Storebrand Emerging Markets A SEK;SE0003455658;EQ_EM
+    Storebrand Europa;SE0000531881;EQ_EU
+    Storebrand FRN Företagsobligation A SEK;SE0004807097;IG_SEK
+    Storebrand Global All Countries;SE0000671919;EQ_ACWI
+    Storebrand Global Low Volatility B;SE0006964649;EQ_WO
+    Storebrand Global Value A;NO0008000973;EQ_WO
+    Storebrand Global Value Net andelsklass;NO0010817588;EQ_WO
+    Storebrand Grön Obligation A SEK;SE0006763967;FI_SEK
+    Storebrand High Yield Företagsobligation A SEK;SE0013877263;HY_SEK
+    Storebrand Japan;SE0000621393;EQ_JP
+    Storebrand Kortränta A SEK;SE0000522500;MM_SEK
+    Storebrand Norge;NO0008000783;EQ_SE
+    Storebrand Obligation A SEK;SE0000522518;BO_SEK
+    Storebrand Sverige;SE0000529992;EQ_SE
+    Storebrand USA;SE0000594111;EQ_US
+    Swedbank Humanfond;SE0000708950;EQ_ACWI
+    Swedbank Robur Access Asien A;SE0007074117;EQ_EM
+    Swedbank Robur Access Edge Em Mkt A;SE0012428290;EQ_EM
+    Swedbank Robur Access Edge Europe A;SE0014609103;EQ_EU
+    Swedbank Robur Access Edge Global A;SE0014429353;EQ_WO
+    Swedbank Robur Access Edge Japan A;SE0007074091;EQ_JP
+    Swedbank Robur Access Edge Sweden A;SE0013121522;EQ_SE
+    Swedbank Robur Access Edge USA A;SE0014556304;EQ_US
+    Swedbank Robur Access Europa A;SE0007073937;EQ_EU
+    Swedbank Robur Access Global A;SE0007074059;EQ_WO
+    Swedbank Robur Access Mix A;SE0000434359;MIX
+    Swedbank Robur Access Sverige A;SE0007074075;EQ_SE
+    Swedbank Robur Access USA A;SE0007074083;EQ_US
+    Swedbank Robur Aktiefond Pension;SE0000602278;MIX
+    Swedbank Robur Allemansfond Komplett;SE0000538910;MIX
+    Swedbank Robur Asienfond A;SE0000539447;EQ_EM
+    Swedbank Robur Bas 100 A;SE0006219184;MIX
+    Swedbank Robur Bas 25 A;SE0002135566;MIX
+    Swedbank Robur Bas 50 A;SE0001285362;MIX
+    Swedbank Robur Bas 75 A;SE0002135558;MIX
+    Swedbank Robur Bas Ränta A;SE0006219168;FI_SEK
+    Swedbank Robur Climate Bond A;SE0020539385;FI_SEK
+    Swedbank Robur Climate Bond High Yield A;SE0010598367;HY_SEK
+    Swedbank Robur Climate Imp A;SE0015948963;EQ_ACWI
+    Swedbank Robur Corp Bond Europe IG A;SE0009805252;IG_SEK
+    Swedbank Robur Corp Bond Nordic A;SE0016831077;IG_SEK
+    Swedbank Robur Corporate Bond Europe A;SE0005506300;IG_SEK
+    Swedbank Robur Corporate Bond Europe B;SE0017483399;IG_SEK
+    Swedbank Robur Corporate Bond Europe High Yield A;SE0011062025;HY_SEK
+    Swedbank Robur Corporate Bond Europe High Yield B;SE0017483415;HY_SEK
+    Swedbank Robur Emerging Europe A;SE0019354218;EQ_EM
+    Swedbank Robur Europafond A;SE0000539454;EQ_EU
+    Swedbank Robur Europafond I;SE0013524949;EQ_EU
+    Swedbank Robur Exportfond A;SE0000602294;EQ_SE
+    Swedbank Robur Fastighet A;SE0000537763;EQ_ACWI
+    Swedbank Robur Fokus;SE0011451772;EQ_ACWI
+    Swedbank Robur Förbundsfond Global;SE0000602237;EQ_WO
+    Swedbank Robur Förbundsfond Sverige Plus;SE0015193321;EQ_SE
+    Swedbank Robur Förbundsräntefond;SE0000602211;BO_SEK
+    Swedbank Robur Förbundsräntefond Kort;SE0000602229;MM_SEK
+    Swedbank Robur Global Emerging Markets A;SE0001912924;EQ_EM
+    Swedbank Robur Global High Dividend A;SE0005249661;EQ_ACWI
+    Swedbank Robur Global High Dividend B;SE0017483423;EQ_ACWI
+    Swedbank Robur Global Impact A;SE0011167899;EQ_ACWI
+    Swedbank Robur Globalfond A;SE0000542979;EQ_ACWI
+    Swedbank Robur Globalfond I;SE0013109519;EQ_ACWI
+    Swedbank Robur Healthcare A;SE0000639445;EQ_ACWI
+    Swedbank Robur Japanfond A;SE0000539413;EQ_JP
+    Swedbank Robur Kapitalinvest;SE0000996241;MIX
+    Swedbank Robur Microcap;SE0009806839;EQ_SE
+    Swedbank Robur Mixfond Pension;SE0000602252;MIX
+    Swedbank Robur Nordenfond;SE0000537722;EQ_SE
+    Swedbank Robur Ny Teknik A;SE0000709123;EQ_SE
+    Swedbank Robur Obligation A;SE0000602260;BO_SEK
+    Swedbank Robur Obligation B;SE0016785885;BO_SEK
+    Swedbank Robur Obligation Lång Inst;SE0014609111;BO_SEK
+    Swedbank Robur Obligation Plus A;SE0000543076;FI_SEK
+    Swedbank Robur Realränta A;SE0000987224;BO_SEK
+    Swedbank Robur Räntefond Kort A;SE0000543043;MM_SEK
+    Swedbank Robur Räntefond Kort Plus A;SE0005467982;MM_SEK
+    Swedbank Robur Selection 25;SE0011643568;MIX
+    Swedbank Robur Selection 50;SE0011643584;MIX
+    Swedbank Robur Selection 75;SE0011643592;MIX
+    Swedbank Robur Small Cap EM A;SE0011643618;EQ_EM
+    Swedbank Robur Small Cap Europe A;SE0000542771;EQ_EU
+    Swedbank Robur Small Cap Global A;SE0000539439;EQ_WO
+    Swedbank Robur Small Cap USA A;SE0012729515;EQ_US
+    Swedbank Robur Småbolagsfond Norden A;SE0000537706;EQ_SE
+    Swedbank Robur Småbolagsfond Sverige A;SE0000602302;EQ_SE
+    Swedbank Robur Stiftelsefond A;SE0000709008;MIX
+    Swedbank Robur Stiftelsefond B;SE0018534547;MIX
+    Swedbank Robur Sverige A;SE0000996233;EQ_SE
+    Swedbank Robur Sverige I;SE0017486962;EQ_SE
+    Swedbank Robur Sverige J;SE0017486970;EQ_SE
+    Swedbank Robur Talenten Aktiefond MEGA J;SE0000542987;MIX
+    Swedbank Robur Talenten Räntefond MEGA B;SE0000542995;BO_SEK
+    Swedbank Robur Technology A;SE0000538944;EQ_ACWI
+    Swedbank Robur Transfer 50;SE0001175712;MIX
+    Swedbank Robur Transfer 60;SE0001175720;MIX
+    Swedbank Robur Transfer 70;SE0001175738;MIX
+    Swedbank Robur Transfer 80;SE0001175746;MIX
+    Swedbank Robur Transfer 90;SE0004548949;MIX
+    Swedbank Robur Transition Energy A;SE0000538969;EQ_ACWI
+    Swedbank Robur Global Trends A;SE0000537680;EQ_WO
+    Swedbank Robur Transition Global J;SE0017133978;EQ_WO
+    Swedbank Robur USA A;SE0000539470;EQ_US
+    """
+    
+    FUNDS_CATALOG = load_funds_from_csv(csv_content)
+
+    if FUNDS_CATALOG:
+        print("\n--- TEST SCENARIO: PL2 Portfolio with Satellites ---")
+        risk_index = 5 # Risk Level 6
+
+        # --- Step 2: Define an initial portfolio using REAL fund names ---
+        # Portfolio based on PL2, which has budgets for EQ_SE and EQ_ACWI
+        initial_portfolio = {
+            "Spiltan Aktiefond Investmentbolag": {"alloc": PL2["EQ_SE"][risk_index]},
+            "Swedbank Robur Globalfond A": {"alloc": PL2["EQ_ACWI"][risk_index]},
+        }
+
+        # --- Step 3: Define which satellites to add ---
+        satellites_to_add = [
+            "ODIN Norden C SEK",              # Belongs to EQ_SE
+            "SEB 364 Sverigefond Småbolag", # Also Belongs to EQ_SE
+            "Pictet-Clean Energy P USD",      # Belongs to EQ_ACWI
+            "Robeco New World Financials D €",  # Also Belongs to EQ_ACWI
+        ]
+
+        print("\nInitial Portfolio (Based on PL2, Risk 6):")
+        pprint.pprint(initial_portfolio)
+        print("\nSatellites to Add:")
+        pprint.pprint(satellites_to_add)
+
+        # --- Step 4: Run the allocation logic ---
+        final_portfolio, details = allocate_funds_within_budget(
+            initial_portfolio, satellites_to_add, reduction_table, pl_dicts, risk_index, FUNDS_CATALOG
+        )
+
+        # --- Step 5: Print the results ---
+        print("\n\n--- TEST RESULTS ---")
+        final_grouped = defaultdict(list)
+        for name, data in final_portfolio.items():
+            asset_class = FUNDS_CATALOG.get(name, {}).get("class", "Unknown")
+            final_grouped[asset_class].append((name, data['alloc']))
+
+        for asset_class, funds in sorted(final_grouped.items()):
+            total_alloc = sum(f[1] for f in funds)
+            print(f"\nAsset Class: {asset_class} (Total Budget: {total_alloc:.2f}%)")
+            print("-" * 55)
+            for name, alloc in sorted(funds):
+                print(f"  - {name:<45}: {alloc:.2f}%")
