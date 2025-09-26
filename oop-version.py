@@ -78,7 +78,7 @@ class AllocationRules:
         return 0.0
 
 # ==============================================================================
-# 3. THE "PORTFOLIO" DATACLASSES (With Reasoning Added)
+# 3. THE "PORTFOLIO" DATACLASSES (With Storytelling Added)
 # ==============================================================================
 
 @dataclass
@@ -90,7 +90,6 @@ class Fund:
 class PortfolioHolding:
     fund: Fund
     allocation: float
-    # **NEW**: Fields to store reasoning for satellites
     is_satellite: bool = False
     leaf_limit: Optional[float] = None
     competing_share: Optional[float] = None
@@ -115,6 +114,28 @@ class Portfolio:
                     p.core_asset_classes.append(cn)
         return p
 
+    def _generate_and_print_plan(self, sats_by_core_fund: dict, risk_index: int):
+        """Prints a narrative plan of the satellite additions."""
+        print("\n" + "="*24 + " ALLOCATION PLAN " + "="*25)
+        for core_fund_name, satellites in sats_by_core_fund.items():
+            core_holding = self.holdings[core_fund_name]
+            core_class = core_holding.fund.asset_class
+            budget = core_holding.allocation
+            reduction_pct = self.rules.get_reduction_pct(core_class.name)
+            headroom = budget * (reduction_pct / 100)
+            
+            print(f"\nSatellites will draw from the '{core_class.name}' budget (held by '{core_fund_name}').")
+            print(f"  - Available satellite headroom: {headroom:.2f}%")
+            
+            for sat_fund in satellites:
+                parent_info = ""
+                if sat_fund.asset_class.parent == core_class:
+                    parent_info = f" (as child of {core_class.name})"
+                leaf_limit = self.rules.find_leaf_allocation(sat_fund.asset_class.name, risk_index)
+                print(f"  - Adding '{sat_fund.name}' (class {sat_fund.asset_class.name}{parent_info}) with a leaf limit of {leaf_limit:.2f}%.")
+        print("="*65)
+
+
     def add_satellites(self, satellite_funds: List[Fund], risk_index: int):
         sats = [s for s in satellite_funds if s.name not in self.holdings]
         s_by_cf = defaultdict(list)
@@ -125,6 +146,10 @@ class Portfolio:
                     if h.fund.asset_class.name == ancestor.name:
                         s_by_cf[h.fund.name].append(sf); break
         
+        # --- PHASE 1: Generate and Print the Plan ---
+        self._generate_and_print_plan(s_by_cf, risk_index)
+
+        # --- PHASE 2: Execute the Allocations ---
         for cfn, sfs in s_by_cf.items():
             ch = self.holdings[cfn]
             headroom = ch.allocation * (self.rules.get_reduction_pct(ch.fund.asset_class.name) / 100)
@@ -139,7 +164,6 @@ class Portfolio:
             
             for si in ss:
                 if si['alloc'] > 0:
-                    # **MODIFIED**: Create holding with reasoning data
                     self.holdings[si['f'].name] = PortfolioHolding(
                         fund=si['f'], allocation=si['alloc'], is_satellite=True,
                         leaf_limit=si['lim'], competing_share=si['share']
@@ -156,18 +180,16 @@ class Portfolio:
         for cn, hs in sorted(grouped.items()):
             budget = sum(h.allocation for h in hs)
             headroom = budget * (self.rules.get_reduction_pct(cn) / 100)
-            print(f"\nAsset class: {cn} (Total: {budget:.2f}%, Satellite space: {headroom:.2f}%)")
+            print(f"\nBudget Group: {cn} (Total: {budget:.2f}%, Headroom: {headroom:.2f}%)")
             print("-" * 55)
             for h in sorted(hs, key=lambda i: i.fund.name):
                 print(f"    - {h.fund.name:<45}: {h.allocation:.2f}%")
-                # **NEW**: Print reasoning if it's a satellite
                 if h.is_satellite:
                     reason = ""
-                    # Use a small tolerance for float comparison
                     if abs(h.allocation - h.leaf_limit) < 1e-9 and h.allocation < h.competing_share:
                         reason = f"Limited by its leaf limit of {h.leaf_limit:.2f}%"
                     else:
-                        reason = f"Limited by its share of Satellite space ({h.competing_share:.2f}%)"
+                        reason = f"Limited by its share of headroom ({h.competing_share:.2f}%)"
                     print(f"      └── Reasoning: {reason}")
 
         total = sum(h.allocation for h in self.holdings.values())
@@ -180,27 +202,23 @@ class Portfolio:
 if __name__ == "__main__":
     rules = AllocationRules(pl_dicts, reduction_table, tree)
     
-    print("="*60, "\nDEMONSTRATING FULL PORTFOLIO ALLOCATION\n" + "="*60)
-    
     core_funds_map = {
         "EQ_WI": Fund("EQ_WI Core Fund", rules.get_asset_class("EQ_WI")),
         "EQ_SE": Fund("EQ_SE Core Fund", rules.get_asset_class("EQ_SE")),
         "EQ_EM": Fund("EQ_EM Core Fund", rules.get_asset_class("EQ_EM")),
-        
     }
     
     portfolio = Portfolio.build_from_level("My PL3 Portfolio", "PL3", 5, core_funds_map, rules)
-    print(f"\nInitial Portfolio: PL3 risk 6")
+    print("Initial Portfolio:")
     portfolio.display()
     
     satellites_to_add = [
         Fund("EQ_JP Satellite Fund", rules.get_asset_class("EQ_JP")),
         Fund("EQ_US Satellite Fund", rules.get_asset_class("EQ_US")),
         Fund("EQ_SE Satellite Fund", rules.get_asset_class("EQ_SE")),
-        Fund("EQ_EU Satellite Fund", rules.get_asset_class("EQ_EU")),
     ]
     
     portfolio.add_satellites(satellites_to_add, 5)
     
-    print("\n\nFinal Portfolio (After Adding Satellites):")
+    print("\nFinal Portfolio:")
     portfolio.display()
